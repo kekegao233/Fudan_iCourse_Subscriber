@@ -2,12 +2,6 @@ name: Optics 37988 - latest four replays
 
 on:
   workflow_dispatch:
-  push:
-    branches: ['codex/optics-latest4']
-    paths:
-      - '.github/workflows/optics_latest4.yml'
-      - 'scripts/collect_recent_optics.py'
-      - 'scripts/optics_export_public.pem'
 
 permissions:
   contents: read
