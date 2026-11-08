@@ -125,6 +125,31 @@ def recent_candidates(lectures, today):
     return result
 
 
+def ensure_session(client, vpn_factory=None):
+    """Renew an expired authenticated session before the next lecture."""
+    if client.check_alive():
+        return
+    if vpn_factory is None:
+        from src.api.webvpn import WebVPNSession
+        vpn_factory = WebVPNSession
+    print("Session expired; renewing school sign-in.", flush=True)
+    client.vpn = login_session(vpn_factory)
+    client._userinfo = None
+    if not client.check_alive():
+        raise RuntimeError("iCourse session verification failed")
+
+
+def session_call(client, operation):
+    """Retry one API read only when the authenticated session was lost."""
+    try:
+        return operation()
+    except Exception:
+        if client.check_alive():
+            raise
+        ensure_session(client)
+        return operation()
+
+
 def transcript_usable(segments, duration_hint_s=0):
     if not segments or sum(len(s.get("text", "").strip()) for s in segments) < 200:
         return False
@@ -206,15 +231,16 @@ def ppt_text(client, pages):
     from src.ai.ocr import ocr_image_text
 
     result, recent_hashes, previous_text, failed = [], [], None, 0
-    for page in pages:
+    consecutive_failures, renewals = 0, 0
+    for index, page in enumerate(pages):
         try:
             with private_output():
                 content = fetch_ppt_image(client, page)
             if not content:
-                failed += 1
-                continue
+                raise ValueError("No slide image returned")
             with Image.open(io.BytesIO(content)) as img:
                 fingerprint = imagehash.dhash(img)
+            consecutive_failures = 0
             if any(fingerprint - old <= 2 for old in recent_hashes[-5:]):
                 continue
             recent_hashes.append(fingerprint)
@@ -225,21 +251,38 @@ def ppt_text(client, pages):
                 previous_text = text
         except Exception:
             failed += 1
+            consecutive_failures += 1
+            if consecutive_failures == 3:
+                try:
+                    if not client.check_alive():
+                        if renewals >= 2:
+                            failed += len(pages) - index - 1
+                            break
+                        ensure_session(client)
+                        renewals += 1
+                        consecutive_failures = 0
+                except Exception:
+                    failed += len(pages) - index - 1
+                    break
+            if consecutive_failures >= 8:
+                failed += len(pages) - index - 1
+                break
     return result, failed
 
 
 def collect_one(client, lecture, info):
+    ensure_session(client)
     sub_id = lecture["sub_id"]
     row = {"sub_id": sub_id, "title": lecture.get("sub_title", ""),
            "date": lecture["date"], "status": "pending", "issues": []}
     try:
-        pages = client.get_ppt_list(COURSE_ID, sub_id)
+        pages = session_call(client, lambda: client.get_ppt_list(COURSE_ID, sub_id))
     except Exception as exc:
         pages = []
         row["issues"].append("ppt_list:" + type(exc).__name__)
     duration_hint = max((p.get("created_sec", 0) for p in pages), default=0)
     try:
-        segments = client.get_transcript_segments(sub_id) or []
+        segments = session_call(client, lambda: client.get_transcript_segments(sub_id)) or []
     except Exception as exc:
         segments = []
         row["issues"].append("official_transcript:" + type(exc).__name__)
@@ -248,11 +291,12 @@ def collect_one(client, lecture, info):
         row["segments"] = segments
     else:
         print(f"Lecture {sub_id}: requesting streaming ASR.", flush=True)
-        video = visible_video_url(client, info)
-        if not video:
-            row["issues"].append("No published player URL for ASR")
-        else:
-            try:
+        try:
+            ensure_session(client)
+            video = session_call(client, lambda: visible_video_url(client, info))
+            if not video:
+                row["issues"].append("No published player URL for ASR")
+            else:
                 ensure_asr_models()
                 from src.ai.transcriber import Transcriber
                 url, headers = client.get_stream_params(video)
@@ -262,22 +306,19 @@ def collect_one(client, lecture, info):
                 row["transcript_source"] = "sensevoice_asr" if len(text.strip()) >= 200 else "asr_partial"
                 row["transcript"] = text
                 row["asr_segments"] = asr_segments
-            except Exception as exc:
-                # The upstream error may include a signed URL or cookies.
-                row["issues"].append("asr:" + type(exc).__name__)
+        except Exception as exc:
+            row["issues"].append(safe_failure(exc, "asr"))
         if not row.get("transcript") and segments:
             row["segments"] = segments
             row["transcript_source"] = "official_partial"
             row["issues"].append("Official transcript has substantial gaps")
-    print(f"Lecture {sub_id}: reading {len(pages)} slide snapshots.", flush=True)
-    row["slides"], row["ppt_failed"] = ppt_text(client, pages)
+    row["slides"], row["ppt_failed"] = [], 0
     row["ppt_total"] = len(pages)
     row["duration_lower_bound_s"] = duration_hint
     source = row.get("transcript_source", "none")
     row["status"] = "complete" if source in ("official", "sensevoice_asr") else "partial"
-    print(f"Lecture {sub_id}: {row['status']}; transcript={source}; "
-          f"OCR pages={len(row['slides'])}; image errors={row['ppt_failed']}.", flush=True)
-    return row
+    print(f"Lecture {sub_id}: {row['status']}; transcript={source}; slides deferred.", flush=True)
+    return row, pages
 
 
 def run():
@@ -308,15 +349,29 @@ def run():
     payload["selected"] = [{k: lecture[k] for k in ("sub_id", "sub_title", "date")}
                            for lecture, _ in selected]
     seal(payload, public_pem, destination)
+    slide_jobs = []
     for lecture, info in reversed(selected):
         print(f"Collecting {lecture['date']} / {lecture['sub_id']}.", flush=True)
         try:
-            row = collect_one(client, lecture, info)
+            row, pages = collect_one(client, lecture, info)
+            slide_jobs.append((row, pages))
         except Exception as exc:
             row = {"sub_id": lecture["sub_id"], "date": lecture["date"],
-                   "status": "failed", "error_type": type(exc).__name__}
+                   "status": "failed", "error": safe_failure(exc, "lecture")}
         payload["lectures"].append(row)
         seal(payload, public_pem, destination)
+    # Preserve every transcript before spending time on image processing.
+    for row, pages in slide_jobs:
+        print(f"Lecture {row['sub_id']}: reading {len(pages)} slide snapshots.", flush=True)
+        try:
+            ensure_session(client)
+            row["slides"], row["ppt_failed"] = ppt_text(client, pages)
+        except Exception as exc:
+            row["issues"].append(safe_failure(exc, "slides"))
+            row["ppt_failed"] = len(pages)
+        seal(payload, public_pem, destination)
+        print(f"Lecture {row['sub_id']}: OCR pages={len(row['slides'])}; "
+              f"image errors={row['ppt_failed']}.", flush=True)
     complete = sum(row["status"] == "complete" for row in payload["lectures"])
     print(f"Complete transcripts: {complete}/{COUNT}. Encrypted result saved.", flush=True)
     return 0 if complete == COUNT else 2
