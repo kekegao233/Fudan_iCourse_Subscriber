@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 import sys
 import tarfile
+import time
+import traceback
 from datetime import datetime, timezone, timedelta
 from urllib.request import urlretrieve
 
@@ -29,6 +31,68 @@ def private_output():
     # Dependency diagnostics may contain signed URLs. Never publish them.
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         yield
+
+
+def safe_failure(exc, stage):
+    """Expose fixed diagnostic labels and code locations, never response text."""
+    message = str(exc)
+    reason = "unclassified"
+    for prefix, label in (
+        ("Student ID and password are required", "missing_credentials"),
+        ("WebVPN session cold", "cold_webvpn_session"),
+        ("Failed to extract lck from CAS redirect chain", "icourse_cas_redirect"),
+        ("Failed to extract lck from redirect", "webvpn_login_redirect"),
+        ("Authentication failed", "webvpn_auth_rejected"),
+        ("iCourse CAS auth failed", "icourse_auth_rejected"),
+        ("Failed to get authChainCode", "webvpn_auth_method_missing"),
+        ("No authChainCode found", "icourse_auth_method_missing"),
+        ("Failed to establish WebVPN session", "webvpn_session_failed"),
+        ("API error for course", "course_api_rejected"),
+    ):
+        if message.startswith(prefix):
+            reason = label
+            break
+    result = {"stage": stage, "type": type(exc).__name__, "reason": reason}
+    frames = traceback.extract_tb(exc.__traceback__)
+    if frames:
+        frame = frames[-1]
+        result["location"] = f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        result["http_status"] = status
+    return result
+
+
+def login_session(vpn_factory, max_attempts=3, sleep=time.sleep):
+    """Retry known transient sessions; do not retry rejected credentials."""
+    from requests.exceptions import ConnectionError, Timeout
+
+    for attempt in range(1, max_attempts + 1):
+        vpn = vpn_factory()
+        stage = "webvpn_login"
+        try:
+            print(f"School login attempt {attempt}/{max_attempts}.", flush=True)
+            with private_output():
+                vpn.login()
+            stage = "icourse_login"
+            print("WebVPN signed in; authenticating iCourse.", flush=True)
+            with private_output():
+                vpn.authenticate_icourse()
+            print("iCourse sign-in completed.", flush=True)
+            return vpn
+        except Exception as exc:
+            diagnostic = safe_failure(exc, stage)
+            print("Login diagnostic: " + json.dumps(diagnostic), flush=True)
+            retryable = isinstance(exc, (ConnectionError, Timeout)) or diagnostic["reason"] in {
+                "cold_webvpn_session", "icourse_cas_redirect",
+            }
+            if not retryable or attempt == max_attempts:
+                raise
+            session = getattr(vpn, "session", None)
+            if session is not None:
+                session.close()
+            sleep(5 * attempt)
 
 
 def recent_candidates(lectures, today):
@@ -226,11 +290,9 @@ def run():
                "collected_at": datetime.now(timezone.utc).isoformat(),
                "lectures": [], "skipped": []}
     print("Signing in to the existing school account.", flush=True)
-    with private_output():
-        vpn = WebVPNSession()
-        vpn.login()
-        vpn.authenticate_icourse()
+    vpn = login_session(WebVPNSession)
     client = ICourseClient(vpn)
+    print("Reading optics course details.", flush=True)
     detail = client.get_course_detail(COURSE_ID)
     payload["course_title"] = detail["title"]
     today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
@@ -264,5 +326,12 @@ if __name__ == "__main__":
     try:
         sys.exit(run())
     except Exception as exc:
-        print("Collection stopped: " + type(exc).__name__ + ". No credentials logged.", flush=True)
+        diagnostic = safe_failure(exc, "collection")
+        print("Collection stopped: " + json.dumps(diagnostic), flush=True)
+        try:
+            seal({"course_id": COURSE_ID, "status": "failed", "error": diagnostic},
+                 (ROOT / "scripts/optics_export_public.pem").read_text(encoding="ascii"),
+                 ROOT / "results/optics37988-latest4.encrypted.json")
+        except Exception:
+            print("Could not save the encrypted diagnostic.", flush=True)
         sys.exit(1)
