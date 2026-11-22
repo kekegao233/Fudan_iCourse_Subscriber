@@ -38,6 +38,7 @@ jobs:
         env:
           StuId: ${{ secrets.STUID }}
           UISPsw: ${{ secrets.UISPSW }}
+          UIS_TOTP_SECRET: ${{ secrets.UIS_TOTP_SECRET }}
           COURSE_IDS: '37988'
           ASR_NUM_THREADS: '4'
           OMP_NUM_THREADS: '2'
