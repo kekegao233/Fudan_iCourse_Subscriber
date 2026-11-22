@@ -2,6 +2,7 @@ import os
 
 STUDENT_ID = os.environ.get("StuId", "")
 PASSWORD = os.environ.get("UISPsw", "")
+TOTP_SECRET = os.environ.get("UIS_TOTP_SECRET", "").strip()
 
 WEBVPN_BASE = "https://webvpn.fudan.edu.cn"
 IDP_BASE = "https://id.fudan.edu.cn"
@@ -181,3 +182,4 @@ COURSE_IDS = [
 # 保留此变量仅用于兼容老部署环境，新部署无需设置。
 # 例：CRAWL_TERM=25
 CRAWL_TERM = os.environ.get("CRAWL_TERM", "").strip()
+
