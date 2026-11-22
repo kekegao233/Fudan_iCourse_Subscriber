@@ -48,6 +48,14 @@ def safe_failure(exc, stage):
         ("Failed to get authChainCode", "webvpn_auth_method_missing"),
         ("No authChainCode found", "icourse_auth_method_missing"),
         ("Failed to establish WebVPN session", "webvpn_session_failed"),
+        ("Set UIS_TOTP_SECRET", "missing_totp_secret"),
+        ("UIS_TOTP_SECRET must be", "invalid_totp_secret"),
+        ("Unified authentication requires a second factor", "unsupported_second_factor"),
+        ("TOTP challenge is missing", "incomplete_totp_challenge"),
+        ("TOTP request failed", "totp_network_failure"),
+        ("TOTP authentication failed", "totp_auth_rejected"),
+        ("TOTP did not finish authentication", "additional_verification_required"),
+        ("No loginToken in iCourse CAS response", "missing_icourse_login_token"),
         ("API error for course", "course_api_rejected"),
     ):
         if message.startswith(prefix):
