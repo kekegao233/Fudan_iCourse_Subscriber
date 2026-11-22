@@ -7,6 +7,7 @@ bundle is written; the corresponding private key stays on the user's computer.
 from __future__ import annotations
 
 import contextlib
+import argparse
 import gzip
 import io
 import json
@@ -95,7 +96,7 @@ def login_session(vpn_factory, max_attempts=3, sleep=time.sleep):
             sleep(5 * attempt)
 
 
-def recent_candidates(lectures, today):
+def recent_candidates(lectures, today, weekday=None):
     """Sort by lesson date/period, then deduplicate actual lesson titles."""
     candidates = []
     for item in lectures:
@@ -103,10 +104,13 @@ def recent_candidates(lectures, today):
         date_match = re.search(r"\d{4}-\d{2}-\d{2}", title)
         date = date_match.group() if date_match else str(item.get("date", ""))
         try:
-            normalized = datetime.strptime(date, "%Y-%m-%d").date().isoformat()
+            lesson_date = datetime.strptime(date, "%Y-%m-%d").date()
+            normalized = lesson_date.isoformat()
         except ValueError:
             continue
         if not item.get("has_playback") or normalized > today:
+            continue
+        if weekday is not None and lesson_date.weekday() != weekday:
             continue
         period = re.search(r"第(\d+)", title)
         sub_id = str(item.get("sub_id", ""))
@@ -321,13 +325,14 @@ def collect_one(client, lecture, info):
     return row, pages
 
 
-def run():
+def run(*, count=COUNT, weekday=None, include_slides=True, destination=None):
     from src.api.webvpn import WebVPNSession
     from src.api.icourse import ICourseClient
 
     public_pem = (ROOT / "scripts/optics_export_public.pem").read_text(encoding="ascii")
-    destination = ROOT / "results/optics37988-latest4.encrypted.json"
-    payload = {"course_id": COURSE_ID, "requested_count": COUNT,
+    destination = destination or ROOT / "results/optics37988-latest4.encrypted.json"
+    payload = {"course_id": COURSE_ID, "requested_count": count,
+               "weekday_filter": weekday, "include_slides": include_slides,
                "collected_at": datetime.now(timezone.utc).isoformat(),
                "lectures": [], "skipped": []}
     print("Signing in to the existing school account.", flush=True)
@@ -338,13 +343,13 @@ def run():
     payload["course_title"] = detail["title"]
     today = datetime.now(timezone(timedelta(hours=8))).date().isoformat()
     selected = []
-    for lecture in recent_candidates(detail["lectures"], today):
+    for lecture in recent_candidates(detail["lectures"], today, weekday=weekday):
         info, code = published_info(client, lecture["sub_id"])
         if info is None:
             payload["skipped"].append({"sub_id": lecture["sub_id"], "code": code})
             continue
         selected.append((lecture, info))
-        if len(selected) == COUNT:
+        if len(selected) == count:
             break
     payload["selected"] = [{k: lecture[k] for k in ("sub_id", "sub_title", "date")}
                            for lecture, _ in selected]
@@ -354,7 +359,9 @@ def run():
         print(f"Collecting {lecture['date']} / {lecture['sub_id']}.", flush=True)
         try:
             row, pages = collect_one(client, lecture, info)
-            slide_jobs.append((row, pages))
+            row["slides_requested"] = include_slides
+            if include_slides:
+                slide_jobs.append((row, pages))
         except Exception as exc:
             row = {"sub_id": lecture["sub_id"], "date": lecture["date"],
                    "status": "failed", "error": safe_failure(exc, "lecture")}
@@ -373,20 +380,30 @@ def run():
         print(f"Lecture {row['sub_id']}: OCR pages={len(row['slides'])}; "
               f"image errors={row['ppt_failed']}.", flush=True)
     complete = sum(row["status"] == "complete" for row in payload["lectures"])
-    print(f"Complete transcripts: {complete}/{COUNT}. Encrypted result saved.", flush=True)
-    return 0 if complete == COUNT else 2
+    print(f"Complete transcripts: {complete}/{count}. Encrypted result saved.", flush=True)
+    return 0 if complete == count else 2
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--tuesday-progress", action="store_true",
+                        help="Collect transcripts for the latest two released Tuesday lessons, without slide OCR.")
+    args = parser.parse_args()
+    destination = ROOT / ("results/optics37988-tuesday2.encrypted.json" if args.tuesday_progress
+                          else "results/optics37988-latest4.encrypted.json")
     try:
-        sys.exit(run())
+        sys.exit(run(count=2 if args.tuesday_progress else COUNT,
+                     weekday=1 if args.tuesday_progress else None,
+                     include_slides=not args.tuesday_progress,
+                     destination=destination))
     except Exception as exc:
         diagnostic = safe_failure(exc, "collection")
         print("Collection stopped: " + json.dumps(diagnostic), flush=True)
         try:
             seal({"course_id": COURSE_ID, "status": "failed", "error": diagnostic},
                  (ROOT / "scripts/optics_export_public.pem").read_text(encoding="ascii"),
-                 ROOT / "results/optics37988-latest4.encrypted.json")
+                 destination)
         except Exception:
             print("Could not save the encrypted diagnostic.", flush=True)
         sys.exit(1)
+
